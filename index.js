@@ -9,7 +9,7 @@ const PORT = 5000
 app.use(cors());
 app.use(express.json());
 
-// Database
+// Database connection
 const client = new MongoClient(process.env.MONGODB_URL);
 
 export async function connectToMongoDB() {
