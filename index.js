@@ -33,10 +33,16 @@ app.post('/create-event', async(req, res) => {
         duration: Number(req.body.duration)}
 
     const result = await eventCollection.insertOne(data)
-    
+
     console.log(result)
     res.send({message: 'API is working..'}, result)
 })
+
+app.get('/events', async(req, res) => {
+    const result = await eventCollection.find().toArray();
+    res.send(result)
+})
+
 
 app.get('/', (req, res) => {
     res.send({message: 'Server is running..'})
