@@ -34,7 +34,7 @@ function isValidEventDate(date) {
     return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
 }
 
-
+//
 app.post('/create-event', async(req, res) => {
     if (!isValidEventDate(req.body?.date)) {
         return res.status(400).json({message: 'A valid event date is required (YYYY-MM-DD).'});
@@ -51,7 +51,7 @@ app.post('/create-event', async(req, res) => {
 })
 
 
-
+//
 app.get('/events', async(req, res) => {
     const result = await eventCollection.find().toArray();
     res.send(result)
@@ -62,6 +62,7 @@ app.get('/events/:id', async(req, res) => {
     res.send(result)
 })
 
+//
 app.patch('/events/:id', async(req, res) => {
     const {id} = req.params;
     const updatedData = req.body;
@@ -75,6 +76,16 @@ app.patch('/events/:id', async(req, res) => {
     )
     res.status(200).json(result)
 })
+
+//
+app.delete('/events/:id', async(req, res) => {
+    const {id} = await req.params;
+    const result = await eventCollection.deleteOne({_id: new ObjectId(id)})
+    res.json(result);
+})
+
+
+
 
 
 app.get('/', (req, res) => {
