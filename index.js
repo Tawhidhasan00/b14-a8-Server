@@ -2,6 +2,7 @@ import express from 'express'
 import { MongoClient, ObjectId } from 'mongodb';
 import 'dotenv/config'
 import cors from 'cors';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const app = express();
 const PORT = 5000
@@ -25,11 +26,60 @@ const mongoClient = await connectToMongoDB();
 const db = mongoClient.db('commonKind')
 
 
+const authURL = process.env.AUTH_URL?.trim().replace(/\/+$/, '');
+if (!authURL) throw new Error('AUTH_URL is required');
+const JWKS = createRemoteJWKSet(new URL('/api/auth/jwks', authURL));
+
+const verifyUser = async(req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({message: 'Unauthorized'});
+  }
+  const token = authHeader.slice(7).trim();
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer: authURL,
+      audience: authURL,
+      requiredClaims: ['sub', 'email', 'exp'],
+    })
+    if (typeof payload.sub !== 'string' || !payload.sub.trim() ||
+        typeof payload.email !== 'string' || !payload.email.trim()) {
+      return res.status(401).json({message: 'Invalid user identity'});
+    }
+    req.user = {
+      id: payload.sub,
+      email: payload.email,
+      name: typeof payload.name === 'string' ? payload.name : '',
+      image: typeof payload.image === 'string' ? payload.image : null,
+    };
+  } catch (error) {
+    console.error('Token validation failed:', error.message);
+    return res.status(401).json({message: 'Invalid or expired token'});
+  }
+
+    next();
+}
+
 const eventCollection = db.collection('event')
 const joinCollection = db.collection('joined')
 
-// Public listings and creator management use the same event documents.
+
 const myEventCollection = eventCollection;
+
+function getEventOwnerFilter(user) {
+    return {$or: [
+        {creatorId: user.id},
+        {creatorId: {$in: [null, '']}, email: user.email},
+    ]};
+}
+
+function getParticipantFilter(user) {
+    return {$or: [
+        {userId: user.id},
+        {userId: {$in: [null, '']}, email: user.email},
+    ]};
+}
 
 
 function getTodayInDhaka(now = new Date()) {
@@ -92,15 +142,11 @@ function getEditableEventData(body) {
 
 async function createEvent(req, res) {
     const body = req.body ?? {};
-    if (typeof body.email !== 'string' || !body.email.trim() ||
-        typeof body.creatorId !== 'string' || !body.creatorId.trim()) {
-        return res.status(400).json({message: 'Creator ID and email are required'});
-    }
     const data = {
         ...getEditableEventData(body),
-        creatorId: body.creatorId.trim(),
-        creatorName: typeof body.creatorName === 'string' ? body.creatorName.trim() : '',
-        email: body.email.trim(),
+        creatorId: req.user.id,
+        creatorName: req.user.name,
+        email: req.user.email,
     };
 
     const validationError = getEventValidationError(data);
@@ -110,22 +156,27 @@ async function createEvent(req, res) {
     res.status(201).json(result);
 }
 
-app.post('/create-event', createEvent);
-app.post('/my-events', createEvent);
-app.post('/joined', async(req, res) => {
-    const data = req.body
-
-    if (
-        typeof data?.email !== 'string' ||
-        !data.email.trim()
-    ) {
-        return res.status(400).json({
-            message: 'Participant email is required'
-        });
+app.post('/create-event', verifyUser, createEvent);
+app.post('/my-events', verifyUser, createEvent);
+app.post('/joined', verifyUser, async(req, res) => {
+    const eventId = req.body?.eventId;
+    if (typeof eventId !== 'string' || !ObjectId.isValid(eventId)) {
+        return res.status(400).json({message: 'Invalid event ID'});
     }
+    const event = await eventCollection.findOne({_id: new ObjectId(eventId)});
+    if (!event) return res.status(404).json({message: 'Event not found'});
+    const {_id, ...eventData} = event;
+    const data = {
+        ...eventData,
+        eventId: _id.toString(),
+        userId: req.user.id,
+        name: req.user.name,
+        email: req.user.email,
+        participantImage: req.user.image,
+    };
     const existingJoin = await joinCollection.findOne({
-        email: data.email,
-        eventId: data.eventId
+        ...getParticipantFilter(req.user),
+        eventId: data.eventId,
     });
 
     if (existingJoin) {
@@ -153,26 +204,32 @@ async function getEventById(req, res) {
     if (!ObjectId.isValid(id)) {
         return res.status(400).json({message: 'Invalid event ID'});
     }
-    const result = await eventCollection.findOne({_id: new ObjectId(id)});
+    const result = await eventCollection.findOne({
+        _id: new ObjectId(id),
+        ...(req.user ? getEventOwnerFilter(req.user) : {}),
+    });
     if (!result) return res.status(404).json({message: 'Event not found'});
     res.send(result);
 }
 app.get('/events/:id', getEventById);
-app.get('/my-events/:id', getEventById);
-app.get('/joined-events/:email', async(req, res) => {
+app.get('/my-events/:id', verifyUser, getEventById);
+app.get('/joined-events/:email', verifyUser, async(req, res) => {
     const {email} = req.params;
-    const result = await joinCollection.find({email:email}).sort({date: 1}).toArray()
+    if (email !== req.user.email) return res.status(403).json({message: 'Forbidden'});
+    const result = await joinCollection.find(getParticipantFilter(req.user)).sort({date: 1}).toArray()
     res.send(result)
 })
-app.get('/my-events/user/:email', async(req, res) => {
+app.get('/my-events/user/:email', verifyUser, async(req, res) => {
     const {email} = req.params;
-    const result = await myEventCollection.find({email: email.trim()}).sort({date: 1}).toArray()
+    if (email !== req.user.email) return res.status(403).json({message: 'Forbidden'});
+    const result = await myEventCollection.find(getEventOwnerFilter(req.user)).sort({date: 1}).toArray()
     res.send(result)
 })
 
 
 //
-app.patch('/my-events/:id', async(req, res) => {
+app.patch('/my-events/:id', verifyUser, async(req, res) => {
+
     const {id} = req.params;
     if (!ObjectId.isValid(id)) {
         return res.status(400).json({message: 'Invalid event ID'});
@@ -181,13 +238,14 @@ app.patch('/my-events/:id', async(req, res) => {
     if (!Object.keys(updatedData).length) {
         return res.status(400).json({message: 'No editable event fields supplied'});
     }
-    const existingEvent = await myEventCollection.findOne({_id: new ObjectId(id)});
+    const filter = {_id: new ObjectId(id), ...getEventOwnerFilter(req.user)};
+    const existingEvent = await myEventCollection.findOne(filter);
     if (!existingEvent) return res.status(404).json({message: 'Event not found'});
     const validationError = getEventValidationError({...existingEvent, ...updatedData});
     if (validationError) return res.status(400).json({message: validationError});
 
     const result = await myEventCollection.updateOne(
-        {_id: new ObjectId(id)},
+        filter,
         {$set: updatedData}
     )
     if (result.matchedCount === 0) {
@@ -202,22 +260,29 @@ app.patch('/my-events/:id', async(req, res) => {
 //     const result = await eventCollection.deleteOne({_id: new ObjectId(id)})
 //     res.json(result);
 // })
-app.delete('/joined-events/:id', async(req, res) => {
+app.delete('/joined-events/:id', verifyUser, async(req, res) => {
     const {id} = req.params;
     const filter = ObjectId.isValid(id)
         ? { $or: [{ _id: new ObjectId(id) }, { _id: id }] }
         : { _id: id };
 
-    const result = await joinCollection.deleteOne(filter);
+    const result = await joinCollection.deleteOne({
+        $and: [filter, getParticipantFilter(req.user)],
+    });
+    if (result.deletedCount === 0) {
+        return res.status(404).json({message: 'Registration not found'});
+    }
     res.send(result);
 })
-app.delete('/my-events/:id', async(req, res) => {
+app.delete('/my-events/:id', verifyUser, async(req, res) => {
     const {id} = req.params;
     if (!ObjectId.isValid(id)) {
         return res.status(400).json({message: 'Invalid event ID'});
     }
 
-    const result = await myEventCollection.deleteOne({_id: new ObjectId(id)});
+    const result = await myEventCollection.deleteOne({
+        _id: new ObjectId(id), ...getEventOwnerFilter(req.user),
+    });
     if (result.deletedCount === 0) {
         return res.status(404).json({message: 'Event not found'});
     }
