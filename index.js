@@ -32,13 +32,47 @@ const joinCollection = db.collection('joined')
 const myEventCollection = eventCollection;
 
 
+function getTodayInDhaka(now = new Date()) {
+    const parts = Object.fromEntries(
+        new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'Asia/Dhaka', year: 'numeric', month: '2-digit', day: '2-digit'
+        }).formatToParts(now).map(({type, value}) => [type, value])
+    );
+    return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
 function isValidEventDate(date) {
     if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
         return false;
     }
 
     const parsed = new Date(`${date}T00:00:00Z`);
-    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
+    return !Number.isNaN(parsed.getTime()) &&
+        parsed.toISOString().slice(0, 10) === date && date > getTodayInDhaka();
+}
+
+function getEventValidationError(data) {
+    const requiredFields = {
+        title: 'Title', description: 'Description', eventType: 'Category',
+        thumbnail: 'Image URL', location: 'Location', date: 'Event date'
+    };
+    for (const [field, label] of Object.entries(requiredFields)) {
+        if (typeof data[field] !== 'string' || !data[field].trim()) {
+            return `${label} is required`;
+        }
+    }
+    const categories = ['Cleanup', 'Plantation', 'Donation', 'Education', 'Food Distribution', 'Winter Relief'];
+    if (!categories.includes(data.eventType)) return 'Choose a valid event category';
+    try {
+        const imageURL = new URL(data.thumbnail);
+        if (!['http:', 'https:'].includes(imageURL.protocol)) throw new Error('Invalid image URL');
+    } catch {
+        return 'Enter a valid image URL starting with http:// or https://';
+    }
+    if (!isValidEventDate(data.date)) {
+        return 'Choose a valid future event date: tomorrow or later in Bangladesh time';
+    }
+    return null;
 }
 
 const editableEventFields = [
@@ -50,7 +84,7 @@ function getEditableEventData(body) {
     const data = Object.fromEntries(
         editableEventFields
             .filter(field => Object.hasOwn(body, field))
-            .map(field => [field, body[field]])
+            .map(field => [field, typeof body[field] === 'string' ? body[field].trim() : body[field]])
     );
     if (Object.hasOwn(data, 'duration')) data.duration = Number(data.duration);
     return data;
@@ -62,16 +96,15 @@ async function createEvent(req, res) {
         typeof body.creatorId !== 'string' || !body.creatorId.trim()) {
         return res.status(400).json({message: 'Creator ID and email are required'});
     }
-    if (!isValidEventDate(body.date)) {
-        return res.status(400).json({message: 'A valid event date is required (YYYY-MM-DD).'});
-    }
-
     const data = {
         ...getEditableEventData(body),
         creatorId: body.creatorId.trim(),
         creatorName: typeof body.creatorName === 'string' ? body.creatorName.trim() : '',
         email: body.email.trim(),
     };
+
+    const validationError = getEventValidationError(data);
+    if (validationError) return res.status(400).json({message: validationError});
 
     const result = await eventCollection.insertOne(data);
     res.status(201).json(result);
@@ -110,7 +143,9 @@ app.post('/joined', async(req, res) => {
 
 //
 app.get('/events', async(req, res) => {
-    const result = await eventCollection.find().sort({date: 1}).toArray();
+    const query = eventCollection.find({date: {$gt: getTodayInDhaka()}}).sort({date: 1});
+    if (req.query.limit === '6') query.limit(6);
+    const result = await query.toArray();
     res.send(result)
 })
 async function getEventById(req, res) {
@@ -126,7 +161,7 @@ app.get('/events/:id', getEventById);
 app.get('/my-events/:id', getEventById);
 app.get('/joined-events/:email', async(req, res) => {
     const {email} = req.params;
-    const result = await joinCollection.find({email:email}).toArray()
+    const result = await joinCollection.find({email:email}).sort({date: 1}).toArray()
     res.send(result)
 })
 app.get('/my-events/user/:email', async(req, res) => {
@@ -146,9 +181,10 @@ app.patch('/my-events/:id', async(req, res) => {
     if (!Object.keys(updatedData).length) {
         return res.status(400).json({message: 'No editable event fields supplied'});
     }
-    if (Object.hasOwn(updatedData, 'date') && !isValidEventDate(updatedData.date)) {
-        return res.status(400).json({message: 'Event date must be a valid date in YYYY-MM-DD format.'});
-    }
+    const existingEvent = await myEventCollection.findOne({_id: new ObjectId(id)});
+    if (!existingEvent) return res.status(404).json({message: 'Event not found'});
+    const validationError = getEventValidationError({...existingEvent, ...updatedData});
+    if (validationError) return res.status(400).json({message: validationError});
 
     const result = await myEventCollection.updateOne(
         {_id: new ObjectId(id)},
